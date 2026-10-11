@@ -1,0 +1,9 @@
+# 运行时生成 / 本机专属, 不进仓库
+settings.json
+__pycache__/
+*.pyc
+ffmpeg
+ffmpeg.exe
+ffmpeg.zip
+extract_tmp/
+.DS_Store
