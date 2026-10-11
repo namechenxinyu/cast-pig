@@ -4,7 +4,7 @@
 Linux / Windows 双平台，打开即用。
 
 ```
-版本: 1.4.0    协议: DLNA/UPnP AVTransport    画质: 1080p30 / 10Mbps CBR    延迟: ~2-4s
+版本: 1.4.2    协议: DLNA/UPnP AVTransport    画质: 1080p30 / 10Mbps CBR    延迟: ~2-4s
 ```
 
 ## 快速开始

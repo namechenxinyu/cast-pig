@@ -352,6 +352,8 @@ class CastEngine:
         self.model = model
         self.log = log
         self.server = None
+        self.port = PORT            # 实际绑定端口(8912 被占时会自动改用其他端口)
+        self.ip = lan_ip_for(ctrl_url)   # 本机在"到设备网段"的地址(代理 TUN 不影响)
         self.procs = []            # [ffmpeg, parec, pacat, ...]
         self.procs_lock = threading.Lock()
         self.state = "空闲"
@@ -645,12 +647,33 @@ class CastEngine:
         threading.Thread(target=self._reader, args=(p,), daemon=True).start()
 
     # --- 对外接口 ---
+    def _bind_server(self):
+        """启动 HTTP 服务; 8912 被占时先重试(等旧连接释放), 仍失败则自动换空闲端口"""
+        last_err = None
+        for _ in range(3):
+            try:
+                srv = ThreadingHTTPServer(("0.0.0.0", PORT), self._make_handler())
+            except OSError as e:
+                if getattr(e, "errno", None) != 98:
+                    raise
+                last_err = e
+                time.sleep(0.8)
+                continue
+            self.server = srv
+            self.port = srv.server_address[1]
+            return
+        # 端口持续被占用: 用系统分配的空闲端口, 不阻塞投屏
+        srv = ThreadingHTTPServer(("0.0.0.0", 0), self._make_handler())
+        self.server = srv
+        self.port = srv.server_address[1]
+        self.log(f"端口 {PORT} 被占用({last_err}), 已自动改用 {self.port}")
+
     def start_screen(self, screen_size, want_audio=True, hls=None):
         """hls: None=自动(按设备判定, 裸流不持续则自动切 HLS), True/False=强制"""
         auto = (hls is None)
         if hls is None:
             hls = self.needs_hls()
-        self.server = ThreadingHTTPServer(("0.0.0.0", PORT), self._make_handler())
+        self._bind_server()
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         if hls:
             self._run_hls_attempt(screen_size, want_audio)
@@ -669,7 +692,7 @@ class CastEngine:
         self._start_capture(screen_size, want_audio)
         time.sleep(2.5)               # 预缓冲
         try:
-            self._push(f"http://{my_ip()}:{PORT}/stream.ts")
+            self._push(f"http://{self.ip}:{self.port}/stream.ts")
         except Exception as e:
             self.log(f"推送指令异常: {e}")
         start = time.time()
@@ -701,7 +724,7 @@ class CastEngine:
                 break
         self.file_mode = False
         try:
-            self._push(f"http://{my_ip()}:{PORT}/hls/live.m3u8")
+            self._push(f"http://{self.ip}:{self.port}/hls/live.m3u8")
         except Exception as e:
             self.log(f"推送指令异常: {e}")
         self.state = "正在投屏(HLS 屏幕)"
@@ -728,9 +751,9 @@ class CastEngine:
                         "-mpegts_flags", "+initial_discontinuity",
                         "-f", "mpegts", STATIC_TS],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        self.server = ThreadingHTTPServer(("0.0.0.0", PORT), self._make_handler())
+        self._bind_server()
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self._push(f"http://{my_ip()}:{PORT}/stream.ts")
+        self._push(f"http://{self.ip}:{self.port}/stream.ts")
         self.state = "正在投屏(视频文件)"
 
     def _push(self, url):
@@ -777,8 +800,19 @@ class CastEngine:
                         pass
             self.procs = []
         if self.server:
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            srv = self.server
             self.server = None
+            # shutdown() 只是停止循环, 必须再 server_close() 才能真正释放监听端口
+            def _close(srv=srv):
+                try:
+                    srv.shutdown()
+                except Exception:
+                    pass
+                try:
+                    srv.server_close()
+                except Exception:
+                    pass
+            threading.Thread(target=_close, daemon=True).start()
         self.state = "已停止"
         for f in (AUDIO_FIFO,):
             try:
@@ -789,19 +823,66 @@ class CastEngine:
         if self.hls_dir and os.path.isdir(self.hls_dir):
             shutil.rmtree(self.hls_dir, ignore_errors=True)
 
-def my_ip():
-    try:
+def my_ip(target_hint=None):
+    """探测本机在目标设备网段的 IP。
+
+    按"到目标设备的路由"选择本机地址, 而不是连 8.8.8.8——后者在开启代理
+    TUN/虚拟网卡时会把 IP 猜成虚拟地址(如 198.18.0.1), 设备根本访问不到。
+    """
+    def _probe(host):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+        try:
+            s.connect((host, 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    if target_hint:
+        try:
+            return _probe(target_hint)
+        except OSError:
+            pass
+    try:
+        return _probe("8.8.8.8")
     except OSError:
         return "127.0.0.1"
 
+def lan_ip_for(ctrl_url):
+    """从设备控制地址解析出设备 IP, 用于按路由探测本机地址"""
+    m = re.match(r"https?://([^:/]+)", ctrl_url or "")
+    return my_ip(m.group(1) if m else None)
+
 # ---------------- 图形界面 ----------------
+
+_single_lock = [None]
+
+def _acquire_single_instance():
+    """单实例锁: 已有窗口在运行时返回 False, 防止双击开两份互相抢设备/端口。
+    Linux 用 flock(进程退出自动释放); Windows 跳过此检查(端口兜底已足够)"""
+    if IS_WIN:
+        return True
+    try:
+        import fcntl
+        f = open(os.path.join(tempfile.gettempdir(), "cast_pig.lock"), "w")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _single_lock[0] = f      # 持有到进程结束
+        return True
+    except OSError:
+        return False
 
 def run_gui():
     import tkinter as tk
     from tkinter import ttk, filedialog
+
+    if not _acquire_single_instance():
+        try:
+            r = tk.Tk()
+            r.withdraw()
+            from tkinter import messagebox
+            messagebox.showinfo("投屏猪", "投屏猪已经在运行了，请使用已打开的窗口。")
+            r.destroy()
+        except Exception:
+            print("[投屏猪] 已在运行, 本次退出")
+        return
 
     root = tk.Tk()
     root.title(f"投屏猪 v{VERSION} · 绿色版")
@@ -815,6 +896,7 @@ def run_gui():
     devices = []          # [(名称, 控制地址, IP)]
     engine_box = [None]
     casting = [False]
+    busy = [False]        # 连接进行中(防止重复点击并发抢端口)
     auto_tried = [False]
 
     top = ttk.Frame(root, padding=10)
@@ -913,6 +995,9 @@ def run_gui():
                 return
 
     def start_cast():
+        if busy[0]:
+            log("正在连接中, 请稍候 …(投屏进行中不要重复点击)")
+            return
         sel = list_box.curselection()
         if not sel:
             log("请先在列表中选择一台设备")
@@ -920,8 +1005,10 @@ def run_gui():
         if mode_var.get() == "file" and not file_path.get():
             log("请先选择视频文件")
             return
+        busy[0] = True
+        start_btn.configure(state="disabled")   # 连接期间禁用按钮, 防止并发抢端口
         dev = devices[sel[0]]
-        log(f"连接 {dev['name']} …")
+        log(f"连接 {dev['name']} …(首次连接约需 10 秒)")
         threading.Thread(target=_cast, args=(dev,), daemon=True).start()
 
     def _cast(dev):
@@ -942,8 +1029,18 @@ def run_gui():
                            "file": file_path.get() if mode_var.get() == "file" else ""})
             root.after(0, lambda: (start_btn.configure(state="disabled"),
                                    stop_btn.configure(state="normal")))
+        except OSError as e:
+            if getattr(e, "errno", None) == 98:
+                root.after(0, log, "端口被占用: 可能有另一个投屏猪窗口在运行, "
+                                   "请关掉旧窗口后重试")
+            else:
+                root.after(0, log, f"投屏失败: {e}")
         except Exception as e:
             root.after(0, log, f"投屏失败: {e}")
+        finally:
+            busy[0] = False
+            if not casting[0]:
+                root.after(0, lambda: start_btn.configure(state="normal"))
 
     def stop_cast():
         eng = engine_box[0]
