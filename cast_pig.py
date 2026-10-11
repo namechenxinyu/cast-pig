@@ -968,31 +968,42 @@ def run_gui():
                 list_box.selection_set(0)
                 list_box.activate(0)
                 start_btn.configure(state="normal")
-            auto_connect()
+            auto_select()
         root.after(0, apply)
 
-    def auto_connect():
-        """打开即投: 上次用过的设备在列表里 → 自动开始(仅首次扫描尝试)"""
-        if auto_tried[0] or casting[0] or not devices:
+    def auto_select():
+        """打开后: 在列表里预选中上次用过的设备并恢复上次模式(不自动投屏)"""
+        if auto_tried[0] or not devices:
             return
         auto_tried[0] = True
         last = load_settings()
         ctrl = last.get("last_ctrl")
-        if not ctrl:
-            return
-        for i, dev in enumerate(devices):
-            if dev["ctrl"] == ctrl:
-                mode = last.get("mode", "screen")
-                if mode == "file" and not os.path.isfile(last.get("file", "")):
-                    mode = "screen"
-                mode_var.set(mode)
-                if mode == "file":
-                    file_path.set(last.get("file", ""))
-                list_box.selection_clear(0, "end")
-                list_box.selection_set(i)
-                log(f"自动连接上次的设备: {dev['name']}")
-                start_cast()
-                return
+        found_last = False
+        found_name = ""
+        if ctrl:
+            for i, dev in enumerate(devices):
+                if dev["ctrl"] == ctrl:
+                    mode = last.get("mode", "screen")
+                    if mode == "file" and not os.path.isfile(last.get("file", "")):
+                        mode = "screen"
+                    mode_var.set(mode)
+                    if mode == "file":
+                        file_path.set(last.get("file", ""))
+                    list_box.selection_clear(0, "end")
+                    list_box.selection_set(i)
+                    list_box.activate(i)
+                    list_box.see(i)
+                    found_last = True
+                    found_name = dev["name"]
+                    break
+        if found_last:
+            if len(devices) > 1:
+                log(f"已预选上次的设备「{found_name}」；"
+                    f"共 {len(devices)} 台设备，可另行选择，然后点「开始投屏」")
+            else:
+                log(f"已找到设备「{found_name}」，点「开始投屏」即投")
+        else:
+            log("发现设备，请选择后点「开始投屏」")
 
     def start_cast():
         if busy[0]:
