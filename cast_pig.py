@@ -317,12 +317,32 @@ def detect_windows_audio_device():
             candidates.append(m.group(1))
     return candidates[0] if candidates else None
 
-def build_capture_cmd(mode, screen_size, audio_src):
-    """构造屏幕采集 ffmpeg 命令; audio_src=None 表示纯画面"""
-    enc = ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-           "-pix_fmt", "yuv420p",
-           "-b:v", "10M", "-maxrate", "10M", "-bufsize", "10M",
-           "-x264-params", "nal-hrd=cbr:force-cfr=1", "-g", "30"]
+def build_capture_cmd(mode, screen_size, audio_src, quality="hls", scale_height=0):
+    """构造屏幕采集 ffmpeg 命令; audio_src=None 表示纯画面。
+
+    quality:
+      "hls"  = CRF 自适应码率(动态画面自动加码率, 最高 25Mbps) —— HLS 模式,
+               画质优先; 无延迟约束, 允许 B 帧提高压缩效率
+      "live" = 恒定 CBR 10Mbps —— 裸流模式下部分渲染器(乐播)要求持续数据流
+    scale_height: >0 时缩放输出高度(如 720 适配 720p 原生面板), 0=不缩放
+    """
+    color = ["-colorspace", "bt709", "-color_primaries", "bt709",
+             "-color_trc", "bt709", "-color_range", "tv"]
+    if quality == "hls":
+        # CRF 自适应码率: 静止/简单画面省带宽, 动态画面自动加到 15Mbps,
+        # 由 x264 按画面复杂度分配, 文字锐利度明显优于固定码率
+        enc = ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+               "-pix_fmt", "yuv420p",
+               "-crf", "17", "-maxrate", "15M", "-bufsize", "15M",
+               "-g", "30"] + color
+    else:
+        enc = ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+               "-pix_fmt", "yuv420p",
+               "-b:v", "10M", "-maxrate", "10M", "-bufsize", "10M",
+               "-x264-params", "nal-hrd=cbr:force-cfr=1", "-g", "30"] + color
+    if scale_height:
+        # 让缩小用我们的高质量 lanczos, 而不是投影仪内置的低质量缩放器
+        enc = ["-vf", f"scale=-2:{scale_height}:flags=lanczos"] + enc
     if IS_WIN:
         pre = ["-f", "gdigrab", "-framerate", "30", "-i", "desktop"]
         if audio_src:
@@ -528,7 +548,8 @@ class CastEngine:
                 except FileNotFoundError:
                     pass
                 env["DISPLAY"] = ":0"
-        cmd = build_capture_cmd(None, screen_size, audio_arg)
+        cmd = build_capture_cmd(None, screen_size, audio_arg, quality="hls",
+                                scale_height=int(load_settings().get("scale_height", 0) or 0))
         # 把结尾的 raw TS 输出参数(最后一个 -f)替换为 HLS 封装
         idx = len(cmd) - 1 - cmd[::-1].index("-f")
         cmd = cmd[:idx] + [
@@ -641,7 +662,9 @@ class CastEngine:
                     pass
                 audio_src = "fifo"
                 env["DISPLAY"] = ":0"
-        p = self._spawn(build_capture_cmd(None, screen_size, audio_src),
+        # 裸流模式必须保持 CBR: 部分渲染器(乐播等)在码率暴跌时会断流
+        p = self._spawn(build_capture_cmd(None, screen_size, audio_src, quality="live",
+                                           scale_height=int(load_settings().get("scale_height", 0) or 0)),
                         stdout=subprocess.PIPE,
                         stderr=subprocess.DEVNULL, env=env, bufsize=10 ** 6)
         threading.Thread(target=self._reader, args=(p,), daemon=True).start()
@@ -936,6 +959,23 @@ def run_gui():
     file_label = ttk.Label(mode_frame, textvariable=file_path, foreground="#086")
     file_label.pack(side="left")
 
+    # 输出分辨率(屏幕镜像模式): 投影仪面板为 720p 时选 720p 更清晰
+    res_frame = ttk.Frame(root, padding=(10, 0, 10, 4))
+    res_frame.pack(fill="x")
+    ttk.Label(res_frame, text="输出画质:").pack(side="left")
+    res_var = tk.StringVar(value="原始分辨率 (推荐)")
+    res_map = {"原始分辨率 (推荐)": 0,
+               "1280x720 (投影仪是720p面板时更清晰)": 720,
+               "1920x1080": 1080}
+    res_combo = ttk.Combobox(res_frame, textvariable=res_var, state="readonly",
+                             values=list(res_map.keys()), width=38)
+    res_combo.pack(side="left", padx=(6, 0))
+    last_scale = int(load_settings().get("scale_height", 0) or 0)
+    for label, h in res_map.items():
+        if h == last_scale:
+            res_var.set(label)
+            break
+
     btn_frame = ttk.Frame(root, padding=10)
     btn_frame.pack(fill="x")
     start_btn = ttk.Button(btn_frame, text="▶  开始投屏", command=lambda: start_cast())
@@ -1037,6 +1077,7 @@ def run_gui():
                            "mac": _mac_of_ip(dev.get("ip", ""))
                                   or load_settings().get("mac", ""),
                            "mode": mode_var.get(),
+                           "scale_height": res_map.get(res_var.get(), 0),
                            "file": file_path.get() if mode_var.get() == "file" else ""})
             root.after(0, lambda: (start_btn.configure(state="disabled"),
                                    stop_btn.configure(state="normal")))

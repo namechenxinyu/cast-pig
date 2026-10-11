@@ -4,7 +4,7 @@
 Linux / Windows 双平台，打开即用。
 
 ```
-版本: 1.4.3    协议: DLNA/UPnP AVTransport    画质: 1080p30 / 10Mbps CBR    延迟: ~2-4s
+版本: 1.5.0    协议: DLNA/UPnP AVTransport    画质: 1080p30 CRF自适应 / 可选720p    延迟: ~2-4s
 ```
 
 ## 快速开始
@@ -81,7 +81,10 @@ cast-pig/
 - 服务器必须实现 **HEAD**（几乎所有渲染器播放前都会 HEAD 探测）。
 - Linux 抓系统声必须用 `parec > FIFO` + ffmpeg `-f s16le` 读管道——
   ffmpeg 的 `-f pulse` 直采会把编码拖到 2~3fps（时间戳倒跳）。
-- 画质编码统一 `veryfast + 10Mbps CBR (nal-hrd=cbr:force-cfr=1) + g=30`。
+- 画质编码: HLS 模式 `veryfast + CRF17 自适应(上限15Mbps) + BT.709 色彩标签`;
+  裸流模式保持 `CBR 10Mbps`(部分渲染器的断流兼容要求)。
+- 「输出画质」可选 720p: 用电脑端 lanczos 缩放替代投影仪内置缩放器,
+  适配 720p 原生面板的平价投影(实测 SSIM: 静态 0.996 / 动态 0.97)。
 
 ## 平台差异
 
