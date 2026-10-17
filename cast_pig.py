@@ -1104,6 +1104,12 @@ def run_gui():
     list_box = tk.Listbox(root, height=8, font=("", 11), activestyle="dotbox")
     list_box.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
+    # 扫描失败时显示的可操作诊断(常驻, 不随状态栏刷新消失)
+    diag_var = tk.StringVar(value="")
+    diag_label = tk.Label(root, textvariable=diag_var, justify="left", anchor="w",
+                          fg="#a33", bg="#fff4f4", wraplength=480, padx=8, pady=6)
+    # 只在有内容时显示(由 _scan 控制 pack/pack_forget)
+
     mode_frame = ttk.LabelFrame(root, text="投屏内容", padding=8)
     mode_frame.pack(fill="x", padx=10)
     mode_var = tk.StringVar(value="screen")
@@ -1167,11 +1173,22 @@ def run_gui():
     def refresh():
         list_box.delete(0, "end")
         start_btn.configure(state="disabled")
+        diag_var.set("")
+        diag_label.pack_forget()
         threading.Thread(target=_scan, daemon=True).start()
 
     def _scan():
         log("扫描中 …")
-        found = discover_renderers(progress=lambda m: root.after(0, log, m))
+        diag_lines = []
+
+        def note(msg):
+            # 诊断类消息(以"诊断:"/"上次的设备"开头)同时收集, 供常驻展示
+            if msg.startswith(("诊断", "上次的设备")):
+                diag_lines.append(msg.replace("诊断: ", ""))
+            log(msg)
+
+        found = discover_renderers(progress=lambda m: root.after(0, note, m))
+
         def apply():
             devices.clear()
             devices.extend(found)
@@ -1181,6 +1198,15 @@ def run_gui():
                 list_box.selection_set(0)
                 list_box.activate(0)
                 start_btn.configure(state="normal")
+            else:
+                # 没找到设备: 常驻显示原因 + 弹窗, 避免用户以为程序卡住了
+                text = "\n".join(dict.fromkeys(diag_lines)) or "未发现可投屏设备"
+                tip = ("\n\n常见原因: 投影仪未开机 / 未连接同一路由器 / "
+                       "或在投影仪上开了「安卓镜像(WiFi直连)」——该模式会断开它与路由器的连接，"
+                       "请退出回首页后再试")
+                diag_var.set(text + tip)
+                diag_label.pack(fill="x", padx=10, pady=(0, 6),
+                               before=mode_frame)
             auto_select()
         root.after(0, apply)
 
