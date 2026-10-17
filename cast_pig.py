@@ -69,7 +69,7 @@ FFMPEG = find_ffmpeg()
 def _avtransport_from_desc(desc_url):
     """从设备描述 XML 提取 {name, ctrl, model}"""
     try:
-        with urllib.request.urlopen(desc_url, timeout=4) as r:
+        with urllib.request.urlopen(desc_url, timeout=2.5) as r:
             xml = r.read().decode(errors="replace")
     except Exception:
         return None
@@ -118,8 +118,26 @@ def _ssdp_probe(timeout=4.0):
     return locations
 
 def _probe_host(ip, ports):
-    """快速探测某主机上第一个可用的 DLNA 服务"""
-    for port in ports:
+    """快速探测某主机上第一个可用的 DLNA 服务。
+
+    先并行探测端口(离线端口 TCP 连接会等满超时, 串行 7 个端口能拖 30 秒),
+    只对真正开放的端口读 description.xml。
+    """
+    import concurrent.futures as cf
+
+    def port_open(p):
+        s = socket.socket()
+        s.settimeout(0.7)
+        try:
+            return p if s.connect_ex((ip, p)) == 0 else None
+        finally:
+            s.close()
+
+    if not ports:
+        return None, None
+    with cf.ThreadPoolExecutor(max_workers=min(8, len(ports))) as ex:
+        open_ports = [p for p in ex.map(port_open, ports) if p]
+    for port in open_ports:
         r = _avtransport_from_desc(f"http://{ip}:{port}/description.xml")
         if r:
             return r, port
@@ -189,26 +207,145 @@ def _deep_port_scan(ip, progress=None):
             found.append((r, ip))
     return found
 
-def _subnet_scan(ports=(25826, 49152, 49153, 49154), progress=None):
-    """并发扫描本网段, 找支持 DLNA 的设备(用于不响应 SSDP 的型号)"""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    prefix = ".".join(my_ip().split(".")[:3])
-    hits = []
+def _lan_prefix():
+    """推断真实局域网网段前缀(如 "192.168.1")。
+
+    不能用 my_ip() 无参版本: 开启代理 TUN 时它会返回 198.18.x 虚拟地址,
+    导致扫描错误网段。优先用上次设备 IP, 否则枚举本机物理网卡地址。
+    """
+    last = load_settings().get("last_ctrl", "")
+    m = re.match(r"https?://(\d+\.\d+\.\d+)\.", last)
+    if m:
+        return m.group(1)
+    try:
+        if IS_WIN:
+            out = subprocess.run(["ipconfig"], capture_output=True, timeout=8)
+            text = out.stdout.decode(errors="replace")
+            for m in re.finditer(r"IPv4[^:]*:\s*(\d+\.\d+\.\d+)\.", text):
+                p = m.group(1)
+                if not p.startswith(("127.", "169.254.")):
+                    return p
+        else:
+            out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                                 capture_output=True, timeout=8)
+            for line in out.stdout.decode(errors="replace").splitlines():
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                iface = parts[1]
+                # 排除回环与虚拟接口(代理 TUN / 容器 / 虚拟机)
+                if re.fullmatch(r"(lo|tun\d*|tap\d*|docker\d*|uengine\d*|veth\w+|br-\w+|wg\d*)", iface):
+                    continue
+                m = re.search(r"inet (\d+\.\d+\.\d+)\.", line)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+    return ".".join(my_ip().split(".")[:3])
+
+def _ping_online(ip, timeout=1.5):
+    """快速判断主机是否在线"""
+    if IS_WIN:
+        args = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip]
+    else:
+        args = ["ping", "-c", "1", "-W", str(max(1, int(timeout))), ip]
+    try:
+        return subprocess.run(args, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              timeout=timeout + 1).returncode == 0
+    except Exception:
+        return False
+
+def _projector_hint_ports(ip):
+    """主机是否开有"投影仪特征"端口, 返回端口号; 需内容验证的端口会核验。"""
+    # 25826/5555/61949 端口本身就是强特征; 8899 需确认是沙发管家
+    for p in (25826, 5555, 61949):
+        s = socket.socket()
+        s.settimeout(0.8)
+        try:
+            if s.connect_ex((ip, p)) == 0:
+                return p
+        finally:
+            s.close()
+    # 8899: 很多设备(如小米音箱)也开这个端口, 必须验证 HTTP 内容
+    s = socket.socket()
+    s.settimeout(0.8)
+    try:
+        opened = s.connect_ex((ip, 8899)) == 0
+    finally:
+        s.close()
+    if opened:
+        try:
+            with urllib.request.urlopen(f"http://{ip}:8899/", timeout=3) as r:
+                body = r.read(4096).decode(errors="replace")
+            if "沙发管家" in body or "shafa" in body.lower():
+                return 8899
+        except Exception:
+            pass
+    return None
+
+def _find_suspects(progress=None):
+    """全子网找"像投影仪"但没开 DLNA 的设备, 用于给出可操作诊断提示"""
+    from concurrent.futures import ThreadPoolExecutor
+    prefix = _lan_prefix()
+    suspects = []
 
     def probe(i):
-        return _probe_host(f"{prefix}.{i}", ports)
+        ip = f"{prefix}.{i}"
+        port = _projector_hint_ports(ip)
+        return (ip, port) if port else None
+
+    try:
+        with ThreadPoolExecutor(max_workers=128) as ex:
+            for r in ex.map(probe, range(1, 255)):
+                if r:
+                    suspects.append(r)
+    except Exception:
+        pass
+    if progress:
+        for ip, port in suspects:
+            progress(f"  疑似投屏设备: {ip} (开放端口 {port})")
+    return suspects
+
+def _subnet_scan(ports=(25826, 49152, 49153, 49154), progress=None):
+    """并发扫描本网段, 找支持 DLNA 的设备(用于不响应 SSDP 的型号)。
+
+    先用 ping 快速筛出在线主机(离线 IP 的 TCP 探测要等满超时, 254×4 次要 27 秒),
+    再只对在线主机探测端口 —— 全流程从 ~27s 降到 ~3s。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    prefix = _lan_prefix()
+    if progress:
+        progress(f"扫描网段 {prefix}.0/24 ...")
+
+    def ping(i):
+        ip = f"{prefix}.{i}"
+        return ip if _ping_online(ip, timeout=0.6) else None
+
+    online = []
+    with ThreadPoolExecutor(max_workers=200) as ex:
+        for ip in ex.map(ping, range(1, 255)):
+            if ip:
+                online.append(ip)
+    if progress:
+        progress(f"网段内 {len(online)} 台主机在线, 探测 DLNA 端口 ...")
+
+    hits = []
+
+    def probe(ip):
+        return ip, _probe_host(ip, ports)
 
     with ThreadPoolExecutor(max_workers=128) as ex:
-        futs = {ex.submit(probe, i): i for i in range(1, 255)}
+        futs = {ex.submit(probe, ip): ip for ip in online}
         for fut in as_completed(futs):
             try:
-                r, port = fut.result()
+                ip, (r, port) = fut.result()
             except Exception:
                 continue
             if r:
-                hits.append((r, f"{prefix}.{futs[fut]}"))
+                hits.append((r, ip))
                 if progress:
-                    progress(f"发现设备: {r['name']} ({prefix}.{futs[fut]})")
+                    progress(f"发现设备: {r['name']} ({ip})")
     return hits
 
 def discover_renderers(progress=None):
@@ -246,9 +383,18 @@ def discover_renderers(progress=None):
 
     if progress:
         progress("尝试已知设备 ...")
+    online_candidates = []
+    offline_candidates = []
     for ip in candidates:
         r, _port = _probe_host(ip, FAST_PORTS)
-        add(r, ip)
+        if add(r, ip):
+            online_candidates.append(ip)
+        elif _ping_online(ip):
+            online_candidates.append(ip)     # 在线但端口变了, 值得深度扫描
+        else:
+            offline_candidates.append(ip)
+    if offline_candidates and progress:
+        progress(f"上次的设备地址 {', '.join(offline_candidates)} 当前无响应")
 
     # 上次连接过的完整控制地址(含端口, 立即验证一次)
     last_ctrl = last_settings.get("last_ctrl", "")
@@ -270,14 +416,41 @@ def discover_renderers(progress=None):
         for r, ip in _subnet_scan(progress=progress):
             add(r, ip)
 
-    if not results:
-        # 终极兜底: 候选主机全端口扫描, 渲染器端口改成什么都能找到
-        for ip in candidates:
+    if not results and online_candidates:
+        # 终极兜底: 只对"像投影仪"的在线主机做全端口扫描
+        # (对普通电脑/手机做全端口扫描既慢又无意义)
+        for ip in online_candidates:
+            hint = _projector_hint_ports(ip)
+            if not hint:
+                if progress:
+                    progress(f"{ip} 无投影仪特征端口, 跳过深度扫描")
+                continue
+            if progress:
+                progress(f"{ip} 有投影仪特征(端口 {hint}), 开始深度扫描 ...")
             for r, ip2 in _deep_port_scan(ip, progress):
                 add(r, ip2)
 
+    if not results and progress:
+        # 没找到设备: 给出可操作的诊断结论, 而不是干巴巴一句"未发现"
+        progress("─" * 30)
+        if offline_candidates:
+            progress(f"诊断: 上次连接的设备({', '.join(offline_candidates)})不在线——"
+                     f"请确认投影仪已开机、且连在同一 Wi-Fi/路由器")
+        progress("正在检查网段内是否有'疑似投影仪'设备 ...")
+        suspects = _find_suspects()
+        if suspects:
+            for ip, port in suspects:
+                if port == 25826:
+                    progress(f"诊断: {ip} 上发现 DLNA 服务但解析失败, 可尝试重启投影仪")
+                else:
+                    progress(f"诊断: {ip} 像是投影仪(端口 {port} 在线), "
+                             f"但其投屏服务未开启——请在投影仪上打开「视频软件投屏」页面")
+        elif not offline_candidates:
+            progress("诊断: 网段内未发现任何投影仪特征设备, "
+                     "请确认投影仪已开机并连接同一网络")
+
     if progress:
-        progress(f"扫描完成, 共 {len(results)} 台设备" if results else "未发现任何设备")
+        progress(f"扫描完成, 共 {len(results)} 台设备" if results else "未发现可投屏设备")
     return results
 
 # ---------------- SOAP 控制 ----------------
