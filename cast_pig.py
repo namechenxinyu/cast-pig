@@ -1221,6 +1221,7 @@ def run_gui():
     casting = [False]
     busy = [False]        # 连接进行中(防止重复点击并发抢端口)
     auto_tried = [False]
+    scan_seq = [0]        # 扫描批次号: 只允许最新一轮扫描回填列表
 
     top = ttk.Frame(root, padding=10)
     top.pack(fill="x")
@@ -1299,17 +1300,21 @@ def run_gui():
         print(f"[投屏猪] {msg}")
 
     def refresh():
+        scan_seq[0] += 1
         list_box.delete(0, "end")
+        devices.clear()
         start_btn.configure(state="disabled")
         diag_var.set("")
         diag_label.pack_forget()
-        threading.Thread(target=_scan, daemon=True).start()
+        threading.Thread(target=_scan, args=(scan_seq[0],), daemon=True).start()
 
-    def _scan():
+    def _scan(seq):
         log("扫描中 …")
         diag_lines = []
 
         def note(msg):
+            if seq != scan_seq[0]:
+                return          # 过期扫描的进度不再刷新状态栏
             # 诊断类消息(以"诊断:"/"上次的设备"开头)同时收集, 供常驻展示
             if msg.startswith(("诊断", "上次的设备")):
                 diag_lines.append(msg.replace("诊断: ", ""))
@@ -1318,6 +1323,12 @@ def run_gui():
         found = discover_renderers(progress=lambda m: root.after(0, note, m))
 
         def apply():
+            if seq != scan_seq[0]:
+                return          # 已有更新的一轮扫描, 丢弃这次结果
+            # 必须在这里清空列表: 只靠 refresh() 清空时, 两轮扫描重叠(打开
+            # 即自动扫描 + 用户又点了一次)会各插一遍, 出现两条相同记录,
+            # 而状态栏还显示"共 1 台设备"
+            list_box.delete(0, "end")
             devices.clear()
             devices.extend(found)
             for dev in devices:
