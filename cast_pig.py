@@ -310,42 +310,42 @@ def _find_suspects(progress=None):
 def _subnet_scan(ports=(25826, 49152, 49153, 49154), progress=None):
     """并发扫描本网段, 找支持 DLNA 的设备(用于不响应 SSDP 的型号)。
 
-    先用 ping 快速筛出在线主机(离线 IP 的 TCP 探测要等满超时, 254×4 次要 27 秒),
-    再只对在线主机探测端口 —— 全流程从 ~27s 降到 ~3s。
+    直接对全部 254 个 IP 做短超时端口探测(约 2~4 秒), **不用 ping 预筛**:
+    投影仪等设备常屏蔽 ICMP 或省电时不响应 ping, 用 ping 筛会漏掉真实设备
+    (v1.5.1 曾因此引入"设备在网却扫不到"的回归)。
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor
     prefix = _lan_prefix()
     if progress:
         progress(f"扫描网段 {prefix}.0/24 ...")
+    ips = [f"{prefix}.{i}" for i in range(1, 255)]
 
-    def ping(i):
-        ip = f"{prefix}.{i}"
-        return ip if _ping_online(ip, timeout=0.6) else None
+    def probe_port(args):
+        ip, p = args
+        s = socket.socket()
+        s.settimeout(0.35)
+        try:
+            return (ip, p) if s.connect_ex((ip, p)) == 0 else None
+        finally:
+            s.close()
 
-    online = []
-    with ThreadPoolExecutor(max_workers=200) as ex:
-        for ip in ex.map(ping, range(1, 255)):
-            if ip:
-                online.append(ip)
-    if progress:
-        progress(f"网段内 {len(online)} 台主机在线, 探测 DLNA 端口 ...")
-
-    hits = []
-
-    def probe(ip):
-        return ip, _probe_host(ip, ports)
-
-    with ThreadPoolExecutor(max_workers=128) as ex:
-        futs = {ex.submit(probe, ip): ip for ip in online}
-        for fut in as_completed(futs):
-            try:
-                ip, (r, port) = fut.result()
-            except Exception:
-                continue
+    tasks = [(ip, p) for ip in ips for p in ports]
+    opened = []
+    with ThreadPoolExecutor(max_workers=400) as ex:
+        for r in ex.map(probe_port, tasks):
             if r:
-                hits.append((r, ip))
-                if progress:
-                    progress(f"发现设备: {r['name']} ({ip})")
+                opened.append(r)
+
+    hits, seen = [], set()
+    for ip, port in opened:
+        if ip in seen:
+            continue
+        r = _avtransport_from_desc(f"http://{ip}:{port}/description.xml")
+        if r:
+            seen.add(ip)
+            hits.append((r, ip))
+            if progress:
+                progress(f"发现设备: {r['name']} ({ip})")
     return hits
 
 def discover_renderers(progress=None):
@@ -433,9 +433,11 @@ def discover_renderers(progress=None):
     if not results and progress:
         # 没找到设备: 给出可操作的诊断结论, 而不是干巴巴一句"未发现"
         progress("─" * 30)
+        progress(f"诊断: 本机在 {_lan_prefix()}.x 网段, 扫描了整个网段未发现投屏设备——"
+                 f"请核对投影仪「设置/网络」里显示的当前网络是否与电脑接的同一台路由器")
         if offline_candidates:
-            progress(f"诊断: 上次连接的设备({', '.join(offline_candidates)})不在线——"
-                     f"请确认投影仪已开机、且连在同一 Wi-Fi/路由器")
+            progress(f"诊断: 上次连接的设备({', '.join(offline_candidates)})不在线"
+                     f"(可能已改 IP 或已离线)")
         progress("正在检查网段内是否有'疑似投影仪'设备 ...")
         suspects = _find_suspects()
         if suspects:
@@ -445,9 +447,8 @@ def discover_renderers(progress=None):
                 else:
                     progress(f"诊断: {ip} 像是投影仪(端口 {port} 在线), "
                              f"但其投屏服务未开启——请在投影仪上打开「视频软件投屏」页面")
-        elif not offline_candidates:
-            progress("诊断: 网段内未发现任何投影仪特征设备, "
-                     "请确认投影仪已开机并连接同一网络")
+        else:
+            progress("诊断: 网段内没有任何投影仪特征设备(已知设备与全子网均已排查)")
 
     if progress:
         progress(f"扫描完成, 共 {len(results)} 台设备" if results else "未发现可投屏设备")
