@@ -1099,6 +1099,7 @@ def run_gui():
     top = ttk.Frame(root, padding=10)
     top.pack(fill="x")
     ttk.Button(top, text="⟳ 扫描设备", command=lambda: refresh()).pack(side="left")
+    ttk.Button(top, text="手动输入IP", command=add_manual_ip).pack(side="left", padx=(6, 0))
     status_var = tk.StringVar(value="点击「扫描设备」开始")
     ttk.Label(top, textvariable=status_var).pack(side="left", padx=12)
 
@@ -1244,6 +1245,68 @@ def run_gui():
                 log(f"已找到设备「{found_name}」，点「开始投屏」即投")
         else:
             log("发现设备，请选择后点「开始投屏」")
+
+    def add_manual_ip():
+        """手动输入设备 IP 连接: 自动发现失灵时的兜底通道。
+        先快速探测常见端口, 失败则对该 IP 做全端口深度扫描"""
+        import tkinter.simpledialog as sd
+        ip = sd.askstring(
+            "手动连接设备",
+            "输入设备的 IP 地址\n\n(投影仪上: 设置 → 网络设置 里可查看当前 IP)",
+            parent=root)
+        if not ip:
+            return
+        ip = ip.strip()
+        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+            log("IP 格式不正确, 应类似 192.168.1.17")
+            return
+        log(f"正在探测 {ip} 的投屏服务 ...")
+        busy[0] = True
+        start_btn.configure(state="disabled")
+
+        def _add(r, found_ip):
+            if any(d["ctrl"] == r["ctrl"] for d in devices):
+                # 已在列表里, 选中即可
+                for i, d in enumerate(devices):
+                    if d["ctrl"] == r["ctrl"]:
+                        idx = i
+                        break
+            else:
+                devices.append(dict(r, ip=found_ip))
+                list_box.insert("end", f"  {r['name']}   ({found_ip})")
+                idx = len(devices) - 1
+            list_box.selection_clear(0, "end")
+            list_box.selection_set(idx)
+            list_box.activate(idx)
+            list_box.see(idx)
+            start_btn.configure(state="normal")
+            log(f"已添加设备「{r['name']}」({found_ip})，点「开始投屏」即投")
+
+        def work():
+            r, _port = _probe_host(ip, FAST_PORTS)
+            if not r:
+                root.after(0, log, f"{ip} 常见端口未找到, 开始全端口深度扫描(约 15 秒) ...")
+                for rr, ip2 in _deep_port_scan(ip, lambda m: root.after(0, log, m)):
+                    r = rr
+                    break
+            def apply():
+                nonlocal r
+                if r:
+                    _add(r, ip)
+                    diag_var.set("")
+                    diag_label.pack_forget()
+                else:
+                    log(f"{ip} 上未找到投屏服务。请核对: ① IP 是否正确(投影仪 设置→网络 可查) "
+                        f"② 投影仪与电脑是否连接同一台路由器 ③ 投影仪是否停在「安卓镜像」页面")
+                    diag_var.set(f"手动添加 {ip} 失败: 该地址上没有投屏服务。\n"
+                                 f"请核对投影仪 设置→网络 里显示的 IP 和 WiFi 名称——"
+                                 f"它必须与电脑连接同一台路由器(如 ChinaNet-SP6a)。")
+                    diag_label.pack(fill="x", padx=10, pady=(0, 6),
+                                   before=mode_frame)
+                busy[0] = False
+            root.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def start_cast():
         if busy[0]:
