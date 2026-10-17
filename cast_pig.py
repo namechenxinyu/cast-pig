@@ -496,23 +496,25 @@ def detect_windows_audio_device():
             candidates.append(m.group(1))
     return candidates[0] if candidates else None
 
-def build_capture_cmd(mode, screen_size, audio_src, quality="hls", scale_height=0):
+def build_capture_cmd(mode, screen_size, audio_src, quality="hls", scale_height=0,
+                      maxrate_cap="15M"):
     """构造屏幕采集 ffmpeg 命令; audio_src=None 表示纯画面。
 
     quality:
-      "hls"  = CRF 自适应码率(动态画面自动加码率, 最高 25Mbps) —— HLS 模式,
-               画质优先; 无延迟约束, 允许 B 帧提高压缩效率
+      "hls"  = CRF 自适应码率(B帧+自适应量化, 同码率更清晰) —— HLS 模式
       "live" = 恒定 CBR 10Mbps —— 裸流模式下部分渲染器(乐播)要求持续数据流
     scale_height: >0 时缩放输出高度(如 720 适配 720p 原生面板), 0=不缩放
+    maxrate_cap: CRF 模式的码率上限(看门狗在网络差时自动调低)
     """
     color = ["-colorspace", "bt709", "-color_primaries", "bt709",
              "-color_trc", "bt709", "-color_range", "tv"]
     if quality == "hls":
-        # CRF 自适应码率: 静止/简单画面省带宽, 动态画面自动加到 15Mbps,
-        # 由 x264 按画面复杂度分配, 文字锐利度明显优于固定码率
-        enc = ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+        # 不用 zerolatency: HLS 分段播放对编码延迟不敏感, 关掉它换回
+        # B帧+前向分析+自适应量化, 同码率下清晰度明显更好(实测满帧30fps)
+        enc = ["-c:v", "libx264", "-preset", "veryfast",
                "-pix_fmt", "yuv420p",
-               "-crf", "17", "-maxrate", "15M", "-bufsize", "15M",
+               "-crf", "17", "-maxrate", maxrate_cap, "-bufsize", maxrate_cap,
+               "-x264-params", "bframes=2:rc-lookahead=10:aq-mode=2",
                "-g", "30"] + color
     else:
         enc = ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
@@ -522,21 +524,24 @@ def build_capture_cmd(mode, screen_size, audio_src, quality="hls", scale_height=
     if scale_height:
         # 让缩小用我们的高质量 lanczos, 而不是投影仪内置的低质量缩放器
         enc = ["-vf", f"scale=-2:{scale_height}:flags=lanczos"] + enc
+    # 长时间投屏的音画同步保护: 采样点对齐视频时间戳, 防止漂移
+    af = ["-af", "aresample=async=1"] if audio_src else []
     if IS_WIN:
         pre = ["-f", "gdigrab", "-framerate", "30", "-i", "desktop"]
         if audio_src:
             pre += ["-f", "dshow", "-i", f"audio={audio_src}"]
         else:
             pre += ["-an"]
-        return [FFMPEG] + pre + enc + (["-c:a", "aac", "-b:a", "128k", "-ar", "44100"]
-                                       if audio_src else []) + \
+        return [FFMPEG] + pre + enc + af + \
+               (["-c:a", "aac", "-b:a", "128k", "-ar", "44100"]
+                if audio_src else []) + \
                ["-f", "mpegts", "pipe:1"]
     # Linux
     pre = ["-f", "x11grab", "-draw_mouse", "1",
            "-video_size", screen_size, "-framerate", "30", "-i", ":0.0"]
     if audio_src == "fifo":
         pre += ["-f", "s16le", "-ar", "44100", "-ac", "2", "-i", AUDIO_FIFO]
-        return [FFMPEG] + pre + enc + \
+        return [FFMPEG] + pre + enc + af + \
                ["-c:a", "aac", "-b:a", "128k", "-ar", "44100",
                 "-f", "mpegts", "pipe:1"]
     return [FFMPEG] + pre + enc + ["-an", "-f", "mpegts", "pipe:1"]
@@ -570,6 +575,8 @@ class CastEngine:
         self._wd_active = threading.Event()
         self._last_size = None
         self._last_audio = None
+        self._cap_mbps = 15      # CRF 码率上限(看门狗检测网络差时自动调低, 最低 6)
+        self._full_repairs = 0   # 全量修复次数(用于码率阶梯)
 
     # --- 看门狗自愈 ---
     def _newest_segment_age(self):
@@ -622,12 +629,25 @@ class CastEngine:
                     except Exception as e:
                         self.log(f"[看门狗] Play 失败: {e}")
                 else:
-                    self.log("[看门狗] 踢了两轮无效, 全量重新推送 ...")
-                    try:
-                        self._push(f"http://{self.ip}:{self.port}/hls/live.m3u8")
-                        kicks = 0
-                    except Exception as e:
-                        self.log(f"[看门狗] 重推失败: {e}")
+                    # 踢了两轮无效: 全量重推; 若反复发生, 按阶梯调低码率上限
+                    # (持续停拉多半是网络跟不上码率, 降码率换取连续性)
+                    self._full_repairs += 1
+                    if self._full_repairs % 2 == 0 and self._cap_mbps > 6:
+                        self._cap_mbps = max(6, self._cap_mbps // 2)
+                        self.log(f"[看门狗] 反复中断, 码率上限降至 {self._cap_mbps}Mbps 并重启采集 ...")
+                        try:
+                            self._stop_capture_procs()
+                            self._run_hls_attempt(self._last_size, self._last_audio)
+                            kicks = 0
+                        except Exception as e:
+                            self.log(f"[看门狗] 重启失败: {e}")
+                    else:
+                        self.log("[看门狗] 踢了两轮无效, 全量重新推送 ...")
+                        try:
+                            self._push(f"http://{self.ip}:{self.port}/hls/live.m3u8")
+                            kicks = 0
+                        except Exception as e:
+                            self.log(f"[看门狗] 重推失败: {e}")
                 stall_rounds = 0
 
     def _start_watchdog(self, screen_size, want_audio):
@@ -798,7 +818,8 @@ class CastEngine:
                     pass
                 env["DISPLAY"] = ":0"
         cmd = build_capture_cmd(None, screen_size, audio_arg, quality="hls",
-                                scale_height=int(load_settings().get("scale_height", 0) or 0))
+                                scale_height=int(load_settings().get("scale_height", 0) or 0),
+                                maxrate_cap=f"{self._cap_mbps}M")
         # 把结尾的 raw TS 输出参数(最后一个 -f)替换为 HLS 封装
         # delete_threshold=4: 播放器网络短暂变慢时, 它来取的旧切片不会被立刻删掉
         # (默认只留 1 个, 易 404 导致播放器卡住重试) —— 抗卡顿的关键参数
