@@ -435,6 +435,16 @@ def discover_renderers(progress=None):
             for r, ip2 in _deep_port_scan(ip, progress):
                 add(r, ip2)
 
+    # 同一物理设备可能在多个端口提供相同服务(如自带 DLNA + 乐播同时开),
+    # 或被多条发现路径命中 —— 控制地址不同但名字+IP 相同, 界面上就成了
+    # 两条"一模一样"的记录。按 (IP, 名称) 折叠, 优先保留上次连接成功的那条。
+    dedup = {}
+    for r in results:
+        key = (r["ip"], r["name"])
+        if key not in dedup or r["ctrl"] == last_settings.get("last_ctrl"):
+            dedup[key] = r
+    results = list(dedup.values())
+
     if not results and progress:
         # 没找到设备: 给出可操作的诊断结论, 而不是干巴巴一句"未发现"
         progress("─" * 30)
