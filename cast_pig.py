@@ -1041,7 +1041,7 @@ class CastEngine:
             pass
         if url.endswith(".m3u8"):
             # HLS 直播流: 实测黄龙等渲染器用空元数据最稳
-            meta = ""
+            didl = None
         else:
             didl = ('<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
                     'xmlns:dc="http://purl.org/dc/elements/1.1/" '
@@ -1051,16 +1051,30 @@ class CastEngine:
                     "<upnp:class>object.item.videoItem</upnp:class>"
                     f'<res protocolInfo="http-get:*:video/mpeg:DLNA.ORG_PN=MPEG_TS_SD_EU_ISO">'
                     f"{url}</res></item></DIDL-Lite>")
-            meta = escape(didl)
-        body = cmd_body("SetAVTransportURI",
-                        "<InstanceID>0</InstanceID>"
-                        f"<CurrentURI>{url}</CurrentURI>"
-                        f"<CurrentURIMetaData>{meta}</CurrentURIMetaData>")
-        # 黄龙等渲染器的 SetAVTransportURI 是同步实现, 可能等待约10秒才响应
-        soap(self.ctrl_url, "SetAVTransportURI", body, timeout=28)
-        soap(self.ctrl_url, "Play",
-             cmd_body("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>"), timeout=20)
-        self.log("已发送播放指令")
+        # 兼容性两级尝试: 先按流类型给标准元数据(部分老渲染器靠它识别媒体类型),
+        # 被拒绝(HTTPError 等)则退回空元数据(黄龙等同步实现设备实测最稳)
+        variants = []
+        if didl:
+            variants.append(("标准元数据", escape(didl)))
+        variants.append(("空元数据", ""))
+        last_err = None
+        for label, meta in variants:
+            body = cmd_body("SetAVTransportURI",
+                            "<InstanceID>0</InstanceID>"
+                            f"<CurrentURI>{url}</CurrentURI>"
+                            f"<CurrentURIMetaData>{meta}</CurrentURIMetaData>")
+            try:
+                # 黄龙等渲染器的 SetAVTransportURI 是同步实现, 可能等待约10秒才响应
+                soap(self.ctrl_url, "SetAVTransportURI", body, timeout=28)
+                soap(self.ctrl_url, "Play",
+                     cmd_body("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>"),
+                     timeout=20)
+                self.log(f"已发送播放指令({label})")
+                return
+            except Exception as e:
+                last_err = e
+                self.log(f"{label}被拒绝({e}), 尝试下一种格式 ...")
+        self.log(f"推送失败: {last_err}")
 
     def stop(self):
         self._wd_active.clear()      # 先停看门狗, 避免它干扰清理过程
