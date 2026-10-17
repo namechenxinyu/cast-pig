@@ -18,6 +18,11 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class _CastHTTPServer(ThreadingHTTPServer):
+    """加大连接队列: 投影仪每秒都来取切片, 网络抖动时请求可能瞬间堆积"""
+    request_queue_size = 64
+    daemon_threads = True
 from xml.sax.saxutils import escape
 
 IS_WIN = (os.name == "nt")
@@ -561,6 +566,74 @@ class CastEngine:
         self.TAIL_JOIN = int(1.5 * 1024 * 1024)
         self.file_mode = False
         self.hls_dir = None
+        # 看门狗: 网络抖动导致播放器放弃拉流/编码器意外退出时自动恢复
+        self._wd_active = threading.Event()
+        self._last_size = None
+        self._last_audio = None
+
+    # --- 看门狗自愈 ---
+    def _newest_segment_age(self):
+        """最新切片的年龄(秒); 无切片返回大数"""
+        newest = 0
+        try:
+            for f in os.listdir(self.hls_dir):
+                if f.endswith(".ts"):
+                    newest = max(newest, os.path.getmtime(os.path.join(self.hls_dir, f)))
+        except OSError:
+            return 1e9
+        return max(0.0, time.time() - newest)
+
+    def _watchdog(self):
+        """每 5 秒体检一次:
+        ① 编码器死亡/切片停更 → 整体重启采集并重新推送
+        ② 切片在更新但播放器 >20 秒没拉数据 → 重新发 Play 踢一脚
+        ③ 踢了两次还不拉 → 全量重新推送(SetAVTransportURI+Play)
+        把'短暂卡顿后永久黑屏'变成 15~45 秒内自动恢复"""
+        kicks = 0
+        last_served, stall_rounds = 0, 0
+        while self._wd_active.is_set():
+            time.sleep(5)
+            if not self._wd_active.is_set() or not self.hls_dir:
+                continue
+            enc_age = self._newest_segment_age()
+            if enc_age > 8:
+                # 编码器停更: 整体重启
+                self.log(f"[看门狗] 切片已 {enc_age:.0f}s 未更新, 自动重启采集 ...")
+                try:
+                    self._stop_capture_procs()
+                    self._run_hls_attempt(self._last_size, self._last_audio)
+                    kicks, stall_rounds = 0, 0
+                except Exception as e:
+                    self.log(f"[看门狗] 重启失败: {e}")
+                continue
+            # 编码器正常, 检查播放器是否还在拉
+            if self.sent_bytes != last_served:
+                last_served, stall_rounds, kicks = self.sent_bytes, 0, 0
+                continue
+            stall_rounds += 1
+            if stall_rounds >= 4:            # ~20 秒没拉数据
+                kicks += 1
+                if kicks <= 2:
+                    self.log(f"[看门狗] 播放器 {stall_rounds*5}s 未拉流, 重新发 Play (第{kicks}次) ...")
+                    try:
+                        soap(self.ctrl_url, "Play",
+                             cmd_body("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>"),
+                             timeout=15)
+                    except Exception as e:
+                        self.log(f"[看门狗] Play 失败: {e}")
+                else:
+                    self.log("[看门狗] 踢了两轮无效, 全量重新推送 ...")
+                    try:
+                        self._push(f"http://{self.ip}:{self.port}/hls/live.m3u8")
+                        kicks = 0
+                    except Exception as e:
+                        self.log(f"[看门狗] 重推失败: {e}")
+                stall_rounds = 0
+
+    def _start_watchdog(self, screen_size, want_audio):
+        self._last_size, self._last_audio = screen_size, want_audio
+        self._wd_active.set()
+        threading.Thread(target=self._watchdog, daemon=True).start()
 
     # --- HTTP 服务 ---
     def _make_handler(self):
@@ -568,6 +641,8 @@ class CastEngine:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            # 关闭 Nagle 攒包: 切片响应立即发出, 消除 ~40ms 级微卡顿
+            disable_nagle_algorithm = True
 
             def do_GET(self):
                 self._route(send_body=True)
@@ -725,11 +800,14 @@ class CastEngine:
         cmd = build_capture_cmd(None, screen_size, audio_arg, quality="hls",
                                 scale_height=int(load_settings().get("scale_height", 0) or 0))
         # 把结尾的 raw TS 输出参数(最后一个 -f)替换为 HLS 封装
+        # delete_threshold=4: 播放器网络短暂变慢时, 它来取的旧切片不会被立刻删掉
+        # (默认只留 1 个, 易 404 导致播放器卡住重试) —— 抗卡顿的关键参数
         idx = len(cmd) - 1 - cmd[::-1].index("-f")
         cmd = cmd[:idx] + [
             "-f", "hls",
             "-hls_time", "1",
-            "-hls_list_size", "6",
+            "-hls_list_size", "8",
+            "-hls_delete_threshold", "4",
             "-hls_flags", "delete_segments+omit_endlist+independent_segments",
             "-hls_segment_filename", os.path.join(d, "seg%05d.ts"),
             os.path.join(d, "live.m3u8"),
@@ -849,7 +927,7 @@ class CastEngine:
         last_err = None
         for _ in range(3):
             try:
-                srv = ThreadingHTTPServer(("0.0.0.0", PORT), self._make_handler())
+                srv = _CastHTTPServer(("0.0.0.0", PORT), self._make_handler())
             except OSError as e:
                 if getattr(e, "errno", None) != 98:
                     raise
@@ -860,7 +938,7 @@ class CastEngine:
             self.port = srv.server_address[1]
             return
         # 端口持续被占用: 用系统分配的空闲端口, 不阻塞投屏
-        srv = ThreadingHTTPServer(("0.0.0.0", 0), self._make_handler())
+        srv = _CastHTTPServer(("0.0.0.0", 0), self._make_handler())
         self.server = srv
         self.port = srv.server_address[1]
         self.log(f"端口 {PORT} 被占用({last_err}), 已自动改用 {self.port}")
@@ -872,6 +950,8 @@ class CastEngine:
             hls = self.needs_hls()
         self._bind_server()
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self._wd_active.set()
+        self._start_watchdog(screen_size, want_audio)
         if hls:
             self._run_hls_attempt(screen_size, want_audio)
             return
@@ -983,6 +1063,7 @@ class CastEngine:
         self.log("已发送播放指令")
 
     def stop(self):
+        self._wd_active.clear()      # 先停看门狗, 避免它干扰清理过程
         try:
             soap(self.ctrl_url, "Stop", cmd_body("Stop", "<InstanceID>0</InstanceID>"),
                  timeout=5)

@@ -4,7 +4,7 @@
 Linux / Windows 双平台，打开即用。
 
 ```
-版本: 1.6.1    协议: DLNA/UPnP AVTransport    画质: 1080p30 CRF自适应 / 可选720p    延迟: ~2-4s
+版本: 1.7.0    协议: DLNA/UPnP AVTransport    画质: 1080p30 CRF自适应 / 可选720p    延迟: ~2-4s
 ```
 
 ## 快速开始
