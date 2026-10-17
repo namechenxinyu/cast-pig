@@ -1099,7 +1099,7 @@ def run_gui():
     top = ttk.Frame(root, padding=10)
     top.pack(fill="x")
     ttk.Button(top, text="⟳ 扫描设备", command=lambda: refresh()).pack(side="left")
-    ttk.Button(top, text="手动输入IP", command=add_manual_ip).pack(side="left", padx=(6, 0))
+    ttk.Button(top, text="手动输入IP", command=lambda: add_manual_ip()).pack(side="left", padx=(6, 0))
     status_var = tk.StringVar(value="点击「扫描设备」开始")
     ttk.Label(top, textvariable=status_var).pack(side="left", padx=12)
 
